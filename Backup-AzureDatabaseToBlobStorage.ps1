@@ -13,38 +13,34 @@
 	
 .PARAMETER DatabaseServerName
 	Specifies the name of the Azure SQL Database Server which script will backup
-	
+
+.PARAMETER DatabaseName
+	Specifies the name of the database which script will backup
+
 .PARAMETER DatabaseAdminUsername
 	Specifies the administrator username of the Azure SQL Database Server
 
 .PARAMETER DatabaseAdminPassword
 	Specifies the administrator password of the Azure SQL Database Server
 
-.PARAMETER DatabaseNames
-	Comma separated list of databases script will backup
-	
-.PARAMETER StorageAccountName
-	Specifies the name of the storage account where backup file will be uploaded
-
-.PARAMETER BlobStorageEndpoint
-	Specifies the base URL of the storage account
-	
 .PARAMETER StorageKey
 	Specifies the storage key of the storage account
+
+.PARAMETER StorageAccountName
+	Specifies the name of the storage account where backup file will be uploaded
 
 .PARAMETER BlobContainerName
 	Specifies the container name of the storage account where backup file will be uploaded. Container will be created if it does not exist.
 
 .PARAMETER RetentionDays
-	Specifies the number of days how long backups are kept in blob storage. Script will remove all older files from container. 
-	For this reason dedicated container should be only used for this script.
+	If provided it specifies the number of days how long backups are kept in blob storage. Script will remove all older backup files for each DatabaseName from the container. No other files that may exist in the folder will get deleted.
+	If not provided or < 0 then no files are removed
 
 .INPUTS
 	None.
 
 .OUTPUTS
 	Human-readable informational and error messages produced during the job. Not intended to be consumed by another runbook.
-
 #>
 
 param(
@@ -52,116 +48,91 @@ param(
 	[String] $ResourceGroupName,
     [parameter(Mandatory=$true)]
 	[String] $DatabaseServerName,
+	[parameter(Mandatory=$true)]
+    [String]$DatabaseName,
     [parameter(Mandatory=$true)]
     [String]$DatabaseAdminUsername,
 	[parameter(Mandatory=$true)]
     [String]$DatabaseAdminPassword,
-	[parameter(Mandatory=$true)]
-    [String]$DatabaseNames,
-    [parameter(Mandatory=$true)]
-    [String]$StorageAccountName,
-    [parameter(Mandatory=$true)]
-    [String]$BlobStorageEndpoint,
     [parameter(Mandatory=$true)]
     [String]$StorageKey,
+    [parameter(Mandatory=$true)]
+    [String]$StorageAccountName,
 	[parameter(Mandatory=$true)]
     [string]$BlobContainerName,
-	[parameter(Mandatory=$true)]
-    [Int32]$RetentionDays
+	[parameter(Mandatory=$false)]
+    [Int32]$RetentionDays = 0
 )
 
 $ErrorActionPreference = 'stop'
 
 function Login() {
-	$connectionName = "AzureRunAsConnection"
 	try
 	{
-		$servicePrincipalConnection = Get-AutomationConnection -Name $connectionName         
-
 		Write-Verbose "Logging in to Azure..." -Verbose
 
-		Add-AzureRmAccount `
-			-ServicePrincipal `
-			-TenantId $servicePrincipalConnection.TenantId `
-			-ApplicationId $servicePrincipalConnection.ApplicationId `
-			-CertificateThumbprint $servicePrincipalConnection.CertificateThumbprint | Out-Null
+		Connect-AzAccount -Identity
 	}
 	catch {
-		if (!$servicePrincipalConnection)
-		{
-			$ErrorMessage = "Connection $connectionName not found."
-			throw $ErrorMessage
-		} else{
-			Write-Error -Message $_.Exception
-			throw $_.Exception
-		}
+		Write-Error -Message $_.Exception
+		throw $_.Exception
 	}
 }
 
-function Create-Blob-Container([string]$blobContainerName, $storageContext) {
-	Write-Verbose "Checking if blob container '$blobContainerName' already exists" -Verbose
-	if (Get-AzureStorageContainer -ErrorAction "Stop" -Context $storageContext | Where-Object { $_.Name -eq $blobContainerName }) {
-		Write-Verbose "Container '$blobContainerName' already exists" -Verbose
-	} else {
-		New-AzureStorageContainer -ErrorAction "Stop" -Name $blobContainerName -Permission Off -Context $storageContext
-		Write-Verbose "Container '$blobContainerName' created" -Verbose
+function Export-To-Blob-Storage([string]$resourceGroupName, [string]$databaseServerName, [string]$databaseName, [string]$databaseAdminUsername, [string]$databaseAdminPassword, [string]$storageKey, [string]$storageAccountName, [string]$blobContainerName) {
+	Write-Verbose "Starting database export database '$databaseName'" -Verbose
+	$securePassword = ConvertTo-SecureString -String $databaseAdminPassword -AsPlainText -Force 
+	$creds = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $databaseAdminUsername, $securePassword
+	$bacpacFilename = $databaseName + (Get-Date).ToString("yyyyMMddHHmm") + ".bacpac"
+	$bacpacUri = "https://" + $storageAccountName + ".blob.core.windows.net/" + $blobContainerName + "/" + $databaseName + "/" + $bacpacFilename
+
+	$exportRequest = New-AzSqlDatabaseExport -ResourceGroupName $resourceGroupName -ServerName $databaseServerName -DatabaseName $databaseName -StorageKeytype "StorageAccessKey" -StorageKey $storageKey -StorageUri $bacpacUri -AdministratorLogin $creds.UserName -AdministratorLoginPassword $creds.Password
+	
+	$exportStatus = Get-AzSqlDatabaseImportExportStatus -OperationStatusLink $exportRequest.OperationStatusLink
+	[Console]::Write("Exporting")
+	while ($exportStatus.Status -eq "InProgress")
+	{
+		Start-Sleep -s 15
+		$exportStatus = Get-AzSqlDatabaseImportExportStatus -OperationStatusLink $exportRequest.OperationStatusLink
+		[Console]::Write(".")
 	}
+	[Console]::WriteLine("")
+	$exportStatus
 }
 
-function Export-To-Blob-Storage([string]$resourceGroupName, [string]$databaseServerName, [string]$databaseAdminUsername, [string]$databaseAdminPassword, [string[]]$databaseNames, [string]$storageKey, [string]$blobStorageEndpoint, [string]$blobContainerName) {
-	Write-Verbose "Starting database export to databases '$databaseNames'" -Verbose
-	$securePassword = ConvertTo-SecureString –String $databaseAdminPassword –AsPlainText -Force 
-	$creds = New-Object –TypeName System.Management.Automation.PSCredential –ArgumentList $databaseAdminUsername, $securePassword
-
-	foreach ($databaseName in $databaseNames.Split(",").Trim()) {
-		Write-Output "Creating request to backup database '$databaseName'"
-
-		$bacpacFilename = $databaseName + (Get-Date).ToString("yyyyMMddHHmm") + ".bacpac"
-		$bacpacUri = $blobStorageEndpoint + $blobContainerName + "/" + $bacpacFilename
-
-		$exportRequest = New-AzureRmSqlDatabaseExport -ResourceGroupName $resourceGroupName –ServerName $databaseServerName `
-			–DatabaseName $databaseName –StorageKeytype "StorageAccessKey" –storageKey $storageKey -StorageUri $BacpacUri `
-			–AdministratorLogin $creds.UserName –AdministratorLoginPassword $creds.Password -ErrorAction "Stop"
-		
-		# Print status of the export
-		Get-AzureRmSqlDatabaseImportExportStatus -OperationStatusLink $exportRequest.OperationStatusLink -ErrorAction "Stop"
-	}
-}
-
-function Delete-Old-Backups([int]$retentionDays, [string]$blobContainerName, $storageContext) {
-	Write-Output "Removing backups older than '$retentionDays' days from blob: '$blobContainerName'"
+function Delete-Old-Backups([string]$resourceGroupName, [string]$storageAccountName, [int]$retentionDays, [string]$databaseName, [string]$blobContainerName) {
+	$context = (Get-AzStorageAccount -ResourceGroupName $resourceGroupName -Name $storageAccountName).Context
 	$isOldDate = [DateTime]::UtcNow.AddDays(-$retentionDays)
-	$blobs = Get-AzureStorageBlob -Container $blobContainerName -Context $storageContext
+	$bacpacFilename = $databaseName + "/" + $databaseName
+
+	$blobs = Get-AzStorageBlob -Container $blobContainerName -Prefix $bacpacFilename -Context $context | Where-Object { $_.Name -like "*.bacpac" }
 	foreach ($blob in ($blobs | Where-Object { $_.LastModified.UtcDateTime -lt $isOldDate -and $_.BlobType -eq "BlockBlob" })) {
 		Write-Verbose ("Removing blob: " + $blob.Name) -Verbose
-		Remove-AzureStorageBlob -Blob $blob.Name -Container $blobContainerName -Context $storageContext
+		Remove-AzStorageBlob -Blob $blob.Name -Container $blobContainerName -Context $context
 	}
 }
 
 Write-Verbose "Starting database backup" -Verbose
 
-$StorageContext = New-AzureStorageContext -StorageAccountName $storageAccountName -StorageAccountKey $storageKey
-
 Login
 
-Create-Blob-Container `
-	-blobContainerName $blobContainerName `
-	-storageContext $storageContext
-	
 Export-To-Blob-Storage `
 	-resourceGroupName $ResourceGroupName `
 	-databaseServerName $DatabaseServerName `
+	-databaseName $DatabaseName `
 	-databaseAdminUsername $DatabaseAdminUsername `
 	-databaseAdminPassword $DatabaseAdminPassword `
-	-databaseNames $DatabaseNames `
 	-storageKey $StorageKey `
-	-blobStorageEndpoint $BlobStorageEndpoint `
+	-storageAccountName $StorageAccountName `
 	-blobContainerName $BlobContainerName
-	
-Delete-Old-Backups `
-	-retentionDays $RetentionDays `
-	-storageContext $StorageContext `
-	-blobContainerName $BlobContainerName
-	
-Write-Verbose "Database backup script finished" -Verbose
 
+if ($RetentionDays -gt 0) {
+	Delete-Old-Backups `
+		-resourceGroupName $ResourceGroupName `
+		-storageAccountName $StorageAccountName `
+		-retentionDays $RetentionDays `
+		-databaseName $DatabaseName `
+		-blobContainerName $BlobContainerName
+}
+
+Write-Verbose "Database backup script finished" -Verbose
